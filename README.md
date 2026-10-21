@@ -184,7 +184,7 @@ meson test -C build
 
 Build dependencies (Debian/Ubuntu): `meson pkgconf libnm-dev
 libglib2.0-dev python3-gi python3-pytest python3-cryptography
-gir1.2-nm-1.0`, and for the GTK front-end `libnma-gtk4-dev libgtk-4-dev
+gir1.2-nm-1.0 dbus-daemon`, and for the GTK front-end `libnma-gtk4-dev libgtk-4-dev
 libnma-dev libgtk-3-dev`. `-Dgnome=false -Dgtk3=false` builds the core
 alone.
 
@@ -203,9 +203,11 @@ scripts/build-deb.sh ubuntu:26.04 resolute dist/
 - `tests/unit`: profile import (through the built libnm plugin) against the
   documented connections in `tests/conformance/expected`, the connection
   format, the VPN plugin D-Bus contract, the session state machine against
-  a fake openvpn3, PKCS#12 conversion, the upgrade migration, the auth
-  dialog and, with a display, the editors (`GDK_BACKEND=broadway` works
-  headless; `OPENVPN3_EDITOR_GTK=3` tests the GTK 3 one).
+  a fake openvpn3, PKCS#12 conversion, the upgrade migration and the auth
+  dialog.
+- `frontends/gtk/tests`: the GTK editors, with a display
+  (`GDK_BACKEND=broadway` works headless; `OPENVPN3_EDITOR_GTK=3` tests the
+  GTK 3 one).
 - `tests/conformance`: what any front-end must hand to the core, run with
   `scripts/conformance <driver>` against the core's reference driver and the
   GTK editors ([docs/frontends.md](docs/frontends.md#conformance)).

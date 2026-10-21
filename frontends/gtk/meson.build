@@ -15,6 +15,11 @@ foreach e : editors
       install: true, install_dir: plugindir)
     # Needs a display (GDK_BACKEND=broadway works headless), skipped without one.
     if pytest.found()
+      test('editor-gtk' + e[4], pytest,
+        args: ['-q', '-p', 'no:cacheprovider', '-c', meson.project_source_root() / 'pytest.ini',
+               '--rootdir', meson.current_source_dir() / 'tests',
+               meson.current_source_dir() / 'tests' / 'test_editor.py'],
+        env: test_env + ['OPENVPN3_EDITOR_GTK=' + e[4]])
       test('conformance-gtk' + e[4], conformance,
         args: [meson.current_source_dir() / 'tests' / 'driver'],
         env: test_env + ['OPENVPN3_EDITOR_GTK=' + e[4]])

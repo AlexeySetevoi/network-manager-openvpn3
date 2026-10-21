@@ -15,7 +15,8 @@ Build-Depends: debhelper-compat (= 13),
                python3-gi <!nocheck>,
                python3-cryptography <!nocheck>,
                python3-pytest <!nocheck>,
-               gir1.2-nm-1.0 <!nocheck>
+               gir1.2-nm-1.0 <!nocheck>,
+               dbus-daemon <!nocheck>
 Standards-Version: 4.7.0
 Homepage: https://github.com/AlexeySetevoi/network-manager-openvpn3
 Vcs-Browser: https://github.com/AlexeySetevoi/network-manager-openvpn3

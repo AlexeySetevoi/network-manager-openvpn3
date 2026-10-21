@@ -86,7 +86,8 @@ OPENVPN3_PLUGIN_DIR=$PWD/build scripts/conformance /path/to/your-driver
 ```
 
 Without `OPENVPN3_PLUGIN_DIR` the installed package is used. Needs
-`python3-gi`, `gir1.2-nm-1.0`, `python3-pytest` and `python3-cryptography`.
+`python3-gi`, `gir1.2-nm-1.0`, `python3-pytest`, `python3-cryptography`
+and, for the unit tests, `dbus-daemon`.
 
 ### The driver
 
