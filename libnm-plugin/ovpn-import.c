@@ -5,6 +5,7 @@
  * openvpn3 needs a self-contained profile, so every file referenced by the
  * profile is inlined.  Credentials are taken out of the profile and stored
  * in the connection instead: the username as data, the password as secret.
+ * The profile itself is a secret too: it carries the private key.
  */
 
 #include "ovpn-import.h"
@@ -122,6 +123,7 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
     gboolean wrote_auth_user_pass = FALSE;
     gboolean has_client          = FALSE;
     gboolean has_remote          = FALSE;
+    gboolean in_connection       = FALSE;
 
     for (char **l = lines; *l; l++) {
         g_autofree char *line = g_strstrip(g_strdup(*l));
@@ -131,6 +133,21 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
         /* The empty piece after the final newline is not a line. */
         if (!l[1] && !**l)
             break;
+        /* A <connection> block holds directives, openvpn3 takes only the
+         * remote from it; nothing inside is inlined. */
+        if (in_connection) {
+            g_auto(GStrv) w = split_words(line);
+
+            if (g_str_equal(line, "</connection>"))
+                in_connection = FALSE;
+            else if (w[0] && g_str_equal(w[0], "remote") && w[1]) {
+                has_remote = TRUE;
+                if (!p->remote)
+                    p->remote = g_strdup(w[1]);
+            }
+            g_string_append_printf(out, "%s\n", line);
+            continue;
+        }
         /* Tolerate CRLF files: g_strstrip removed the \r above. */
         if (inline_tag) {
             g_autofree char *end = g_strdup_printf("</%s>", inline_tag);
@@ -150,6 +167,11 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
                     p->needs_cert_pass = TRUE;
                 g_string_append_printf(out, "%s\n", g_strchomp(*l));
             }
+            continue;
+        }
+        if (g_str_equal(line, "<connection>")) {
+            in_connection = TRUE;
+            g_string_append_printf(out, "%s\n", line);
             continue;
         }
         if (line[0] == '<' && g_str_has_suffix(line, ">") && line[1] != '/') {
@@ -230,9 +252,9 @@ openvpn3_profile_parse(const char *text, const char *base_dir, GError **error)
         g_string_append_printf(out, "%s\n", line);
     }
 
-    if (inline_tag) {
+    if (inline_tag || in_connection) {
         g_set_error(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_INVALID_PROPERTY,
-                    "Unterminated <%s> block in the profile", inline_tag);
+                    "Unterminated <%s> block in the profile", inline_tag ? inline_tag : "connection");
         return NULL;
     }
     if (!has_client || !has_remote) {
@@ -281,7 +303,9 @@ openvpn3_connection_from_profile(Openvpn3Profile *p, const char *id)
     nm_connection_add_setting(con, s_con);
 
     g_object_set(s_vpn, NM_SETTING_VPN_SERVICE_TYPE, OPENVPN3_SERVICE_TYPE, NULL);
-    openvpn3_setting_set_profile(NM_SETTING_VPN(s_vpn), p->config);
+    /* System-owned: NetworkManager keeps it root-only and hands it to the
+     * service itself, no agent needed. */
+    openvpn3_setting_set_profile(NM_SETTING_VPN(s_vpn), p->config, NM_SETTING_SECRET_FLAG_NONE);
     if (p->username)
         nm_setting_vpn_add_data_item(NM_SETTING_VPN(s_vpn), OPENVPN3_KEY_USERNAME, p->username);
     if (p->needs_user_pass) {
@@ -318,13 +342,34 @@ openvpn3_profile_remote(const char *config)
     return p ? g_strdup(p->remote) : NULL;
 }
 
+gboolean
+openvpn3_setting_profile_is_secret(NMSettingVpn *s_vpn)
+{
+    return s_vpn && nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE_FLAGS);
+}
+
+NMSettingSecretFlags
+openvpn3_setting_get_profile_flags(NMSettingVpn *s_vpn)
+{
+    NMSettingSecretFlags flags = NM_SETTING_SECRET_FLAG_NONE;
+
+    if (openvpn3_setting_profile_is_secret(s_vpn))
+        nm_setting_get_secret_flags(NM_SETTING(s_vpn), OPENVPN3_KEY_PROFILE, &flags, NULL);
+    return flags;
+}
+
 char *
 openvpn3_setting_get_profile(NMSettingVpn *s_vpn)
 {
-    const char *b64 = s_vpn ? nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE) : NULL;
+    const char *b64;
     g_autofree guchar *raw = NULL;
     gsize len;
 
+    if (!s_vpn)
+        return NULL;
+    /* With flags the profile is a secret; a data copy next to it is stale. */
+    b64 = openvpn3_setting_profile_is_secret(s_vpn) ? nm_setting_vpn_get_secret(s_vpn, OPENVPN3_KEY_PROFILE)
+                                                    : nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_PROFILE);
     if (!b64)
         return NULL;
     raw = g_base64_decode(b64, &len);
@@ -334,9 +379,16 @@ openvpn3_setting_get_profile(NMSettingVpn *s_vpn)
 }
 
 void
-openvpn3_setting_set_profile(NMSettingVpn *s_vpn, const char *profile)
+openvpn3_setting_set_profile(NMSettingVpn *s_vpn, const char *profile, NMSettingSecretFlags flags)
 {
-    g_autofree char *b64 = g_base64_encode((const guchar *) profile, strlen(profile));
+    g_autofree char *b64    = g_base64_encode((const guchar *) profile, strlen(profile));
+    g_autofree char *remote = openvpn3_profile_remote(profile);
 
-    nm_setting_vpn_add_data_item(s_vpn, OPENVPN3_KEY_PROFILE, b64);
+    nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_PROFILE);
+    nm_setting_vpn_add_secret(s_vpn, OPENVPN3_KEY_PROFILE, b64);
+    nm_setting_set_secret_flags(NM_SETTING(s_vpn), OPENVPN3_KEY_PROFILE, flags, NULL);
+    if (remote)
+        nm_setting_vpn_add_data_item(s_vpn, OPENVPN3_KEY_REMOTE, remote);
+    else
+        nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_REMOTE);
 }

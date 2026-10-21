@@ -2,13 +2,18 @@
 """Import/export through the built libnm plugin, the way nmcli uses it."""
 
 import base64
+import json
 import os
+import stat
 
 import gi
 import pytest
 
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
+
+import nmjson  # noqa: E402
+from nm_openvpn3 import connection  # noqa: E402
 
 PLUGIN_DIR = os.environ.get("OPENVPN3_PLUGIN_DIR")
 pytestmark = pytest.mark.skipif(not PLUGIN_DIR, reason="needs the built plugin (meson test)")
@@ -31,7 +36,7 @@ def write(tmp_path, name, text):
 
 def vpn(con):
     s = con.get_setting_vpn()
-    return s, base64.b64decode(s.get_data_item("profile")).decode()
+    return s, base64.b64decode(s.get_secret("profile")).decode()
 
 
 def test_plugin_properties(plugin):
@@ -52,7 +57,7 @@ def test_inline_credentials_move_into_connection(plugin, tmp_path):
     assert s.get_service_type() == SERVICE
     assert s.get_data_item("username") == "testuser"
     assert s.get_secret("password") == "s3cret"
-    assert s.get_data_item("password-flags") in (None, "0")
+    assert s.get_data_item("password-flags") == "0"
     assert "s3cret" not in config and "testuser" not in config
     assert "auth-user-pass\n" in config
     assert f"<ca>\n{PEM}</ca>\n" in config
@@ -176,3 +181,63 @@ def test_plain_key_needs_no_passphrase(plugin, tmp_path):
     path = write(tmp_path, "n.ovpn", f"client\nremote vpn.example.net\n<key>\n{pem_key()}</key>\n")
     s, _ = vpn(plugin.import_(path))
     assert s.get_data_item("cert-pass-flags") is None
+
+
+def test_profile_is_a_system_owned_secret(plugin, tmp_path):
+    path = write(tmp_path, "s.ovpn", f"client\nremote vpn.example.net 1194\n<ca>\n{PEM}</ca>\n")
+    s = plugin.import_(path).get_setting_vpn()
+    assert s.get_data_item("profile") is None
+    assert s.get_data_item("profile-flags") == "0"
+    assert s.get_data_item("remote") == "vpn.example.net"
+    assert connection.validate(s) == []
+
+
+def test_remote_inside_connection_block(plugin, tmp_path):
+    path = write(tmp_path, "b.ovpn", "client\n<connection>\nremote vpn1.example.net 1194\n</connection>\n"
+                 "<connection>\nremote vpn2.example.net\nca not-inlined.crt\n</connection>\n")
+    s, config = vpn(plugin.import_(path))
+    assert s.get_data_item("remote") == "vpn1.example.net"
+    assert "<connection>\nremote vpn1.example.net 1194\n</connection>\n" in config
+    assert "ca not-inlined.crt" in config
+
+
+def test_unterminated_connection_block(plugin, tmp_path):
+    path = write(tmp_path, "u.ovpn", "client\n<connection>\nremote vpn.example.net\n")
+    with pytest.raises(GLib.Error, match="Unterminated <connection>"):
+        plugin.import_(path)
+
+
+def test_export_is_private(plugin, tmp_path):
+    con = plugin.import_(write(tmp_path, "x.ovpn", "client\nremote vpn.example.net\n"))
+    out = tmp_path / "out.ovpn"
+    out.write_text("old")
+    out.chmod(0o644)
+    assert plugin.export(str(out), con)
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+def test_export_without_secret_profile_explains(plugin, tmp_path):
+    con = plugin.import_(write(tmp_path, "y.ovpn", "client\nremote vpn.example.net\n"))
+    con.get_setting_vpn().remove_secret("profile")
+    with pytest.raises(GLib.Error, match="stored as a secret"):
+        plugin.export(str(tmp_path / "y-out.ovpn"), con)
+
+
+EXPECTED = os.path.join(os.path.dirname(__file__), "..", "conformance", "expected")
+PROFILES = os.path.join(os.path.dirname(__file__), "..", "conformance", "profiles")
+
+
+@pytest.mark.parametrize("name", sorted(f[:-5] for f in os.listdir(PROFILES) if f.endswith(".ovpn")))
+def test_import_matches_documented_connection(plugin, name):
+    """The core side of the front-end boundary: changing what import writes
+    changes these files and docs/connection-format.md with them."""
+    got = nmjson.to_dict(plugin.import_(os.path.join(PROFILES, f"{name}.ovpn")))["vpn"]
+    # Readable in a diff: the profile as lines instead of base64.
+    got["secrets"]["profile"] = base64.b64decode(got["secrets"]["profile"]).decode().splitlines()
+    path = os.path.join(EXPECTED, f"{name}.json")
+    if os.environ.get("OPENVPN3_UPDATE_EXPECTED"):
+        with open(path, "w") as f:
+            json.dump(got, f, indent=2, sort_keys=True)
+            f.write("\n")
+    with open(path) as f:
+        assert got == json.load(f)

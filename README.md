@@ -10,6 +10,19 @@ does: the VPN toggle in GNOME Quick Settings, **Settings → Network**, and
 
 Supported releases: Ubuntu 26.04, Ubuntu 24.04, Debian 13 (amd64).
 
+## Desktops
+
+| Desktop | Status |
+|---|---|
+| GNOME | Editor for GNOME Settings, prompts in GNOME Shell (`network-manager-openvpn3-gnome`). |
+| Xfce, MATE, Cinnamon, LXQt and others with nm-applet | GTK 3 editor in nm-connection-editor, prompts from nm-applet (`network-manager-openvpn3-gnome`). |
+| Any, from the command line | `nmcli` (`network-manager-openvpn3`). |
+| KDE Plasma | Needs a front-end; see [Support for another desktop](docs/frontends.md). |
+
+The core package works without any desktop; a front-end adds the editor
+for one. [docs/frontends.md](docs/frontends.md) says how to write one and
+how to check it with the conformance suite.
+
 ## Installation
 
 ### From the APT repository
@@ -32,8 +45,8 @@ gpg --show-keys /etc/apt/keyrings/network-manager-openvpn3.gpg
 
 The fingerprint must be `58DA FDC4 A0AE 538F 7D72  5E61 78EB B361 EFD7 F500`.
 
-`network-manager-openvpn3-gnome` adds the editor for GNOME Settings; on a
-system without GNOME install `network-manager-openvpn3` alone.
+`network-manager-openvpn3-gnome` adds the GTK editors; without a GTK
+desktop install `network-manager-openvpn3` alone.
 
 The packages depend on the OpenVPN 3 client (`openvpn3-client`). Ubuntu
 26.04 and Debian 13 have it in their archives. On Ubuntu 24.04 add the
@@ -82,6 +95,10 @@ After that the connection is in the VPN menu of Quick Settings.
 - Files referenced by the profile (`ca`, `cert`, `key`, `tls-auth`,
   `tls-crypt`, `auth-user-pass` …) are read once at import and stored inside
   the connection, the original files are no longer needed.
+- The profile, private key included, is a NetworkManager secret: only root
+  and the service can read it. Connections made before 0.2.0 kept it as
+  plain connection data, readable by every local user; upgrading the
+  package moves them.
 - Credentials in the profile (an inline `<auth-user-pass>` block or the file
   it points to) move into the connection: the username as data, the password
   as a NetworkManager secret. Without them the password is agent-owned: GNOME
@@ -100,13 +117,15 @@ After that the connection is in the VPN menu of Quick Settings.
   passphrase of an encrypted key or bundle is a NetworkManager secret
   ("Private key passphrase"), asked for by GNOME and optionally kept in the
   keyring.
-- Exported profiles contain no credentials.
+- Exported profiles contain no credentials, but the private key; they are
+  written readable by their owner only.
 
 ### Editors
 
 - **GNOME Settings** uses the GTK 4 editor, **nm-connection-editor** the
   GTK 3 one; both come with `network-manager-openvpn3-gnome`. They load a
   profile from a file and edit the username and the stored secrets.
+- Editors for other desktops: [docs/frontends.md](docs/frontends.md).
 
 ### Limitation: PKCS#11
 
@@ -137,9 +156,13 @@ openvpn3 implements it.
   alone. To enable it by hand:
   `sudo openvpn3-admin netcfg-service --config-set systemd-resolved 1`.
 - Sessions belong to root; `sudo openvpn3 sessions-list` shows them.
-- The profile is stored base64-encoded in the connection (`vpn.data`
-  key `profile`): some NetworkManager settings backends (netplan on Ubuntu)
-  do not keep multi-line values intact.
+- The profile is stored base64-encoded as a connection secret
+  (`vpn.secrets` key `profile`): some NetworkManager settings backends
+  (netplan on Ubuntu) do not keep multi-line values intact. The whole
+  format: [docs/connection-format.md](docs/connection-format.md).
+- When openvpn3 ends a session, the journal says why (for example the
+  server expiring the session); openvpn3's own log is in
+  `journalctl -t openvpn3-service-log`.
 
 Logs: `journalctl -u NetworkManager | grep nm-openvpn3`.
 
@@ -160,8 +183,14 @@ meson test -C build
 ```
 
 Build dependencies (Debian/Ubuntu): `meson pkgconf libnm-dev
-libnma-gtk4-dev libgtk-4-dev libglib2.0-dev python3-gi python3-pytest
-gir1.2-nm-1.0`. `-Dgnome=false` skips the GTK 4 editor.
+libglib2.0-dev python3-gi python3-pytest python3-cryptography
+gir1.2-nm-1.0`, and for the GTK front-end `libnma-gtk4-dev libgtk-4-dev
+libnma-dev libgtk-3-dev`. `-Dgnome=false -Dgtk3=false` builds the core
+alone.
+
+Layout: `src/` the service (Python), `libnm-plugin/` import, export and the
+connection format (C, no GTK), `auth-dialog/` the helper for secret agents,
+`frontends/gtk/` the GTK editors.
 
 Packages for one distribution, built in a container:
 
@@ -171,14 +200,19 @@ scripts/build-deb.sh ubuntu:26.04 resolute dist/
 
 ### Tests
 
-- `tests/unit`: profile import (through the built libnm plugin), the VPN
-  plugin D-Bus contract, the session state machine against a fake openvpn3,
-  PKCS#12 conversion, the auth dialog and, with a display, the editors
-  (`GDK_BACKEND=broadway` works headless; `OPENVPN3_EDITOR_GTK=3` tests the
-  GTK 3 one).
+- `tests/unit`: profile import (through the built libnm plugin) against the
+  documented connections in `tests/conformance/expected`, the connection
+  format, the VPN plugin D-Bus contract, the session state machine against
+  a fake openvpn3, PKCS#12 conversion, the upgrade migration, the auth
+  dialog and, with a display, the editors (`GDK_BACKEND=broadway` works
+  headless; `OPENVPN3_EDITOR_GTK=3` tests the GTK 3 one).
+- `tests/conformance`: what any front-end must hand to the core, run with
+  `scripts/conformance <driver>` against the core's reference driver and the
+  GTK editors ([docs/frontends.md](docs/frontends.md#conformance)).
 - `tests/integration/run.sh`: end to end on a disposable machine — a local
   OpenVPN server, openvpn3 as the client, NetworkManager with this plugin:
-  connect, routes and DNS, reconnect, disconnect, wrong password, password
+  connect, routes and DNS, the profile hidden from other users, migration
+  of an old connection, reconnect, disconnect, wrong password, password
   from a secret agent, one-time code, PKCS#12 bundle and encrypted key
   against a certificate-only server. `tests/integration/Vagrantfile` runs it
   in libvirt VMs:
@@ -189,7 +223,8 @@ scripts/build-deb.sh ubuntu:26.04 resolute dist/
   vagrant ssh -c 'sudo /repo/tests/integration/run.sh /debs'
   ```
 
-CI builds and tests every distribution and runs the integration test on
+CI builds and tests every distribution, the core alone without GTK, the
+GTK editors and their conformance, and runs the integration test on
 Ubuntu 24.04. Tags `v*` publish a release and the APT repository.
 
 ## License

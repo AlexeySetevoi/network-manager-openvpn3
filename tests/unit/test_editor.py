@@ -17,6 +17,8 @@ GTK = os.environ.get("OPENVPN3_EDITOR_GTK", "4")
 gi.require_version("Gtk", f"{GTK}.0")
 from gi.repository import NM  # noqa: E402
 
+import nmjson  # noqa: E402
+
 PLUGIN_DIR = os.environ.get("OPENVPN3_PLUGIN_DIR")
 SERVICE = "org.freedesktop.NetworkManager.openvpn3"
 PROFILE = "client\nremote vpn.example.net 1194\nauth-user-pass\n"
@@ -35,7 +37,7 @@ pytestmark = pytest.mark.skipif(not (PLUGIN_DIR and HAVE_DISPLAY),
                                 reason="needs the built plugin and a display")
 
 
-def connection():
+def connection(legacy=False):
     con = NM.SimpleConnection.new()
     s_con = NM.SettingConnection.new()
     s_con.set_property(NM.SETTING_CONNECTION_ID, "office")
@@ -43,9 +45,15 @@ def connection():
     con.add_setting(s_con)
     s_vpn = NM.SettingVpn.new()
     s_vpn.set_property(NM.SETTING_VPN_SERVICE_TYPE, SERVICE)
-    s_vpn.add_data_item("profile", base64.b64encode(PROFILE.encode()).decode())
+    if legacy:
+        s_vpn.add_data_item("profile", base64.b64encode(PROFILE.encode()).decode())
+    else:
+        s_vpn.add_data_item("profile-flags", "0")
+        s_vpn.add_data_item("remote", "vpn.example.net")
+        s_vpn.add_secret("profile", base64.b64encode(PROFILE.encode()).decode())
     s_vpn.add_data_item("username", "testuser")
     s_vpn.add_data_item("password-flags", "1")
+    s_vpn.add_data_item("challenge-response-flags", "2")
     con.add_setting(s_vpn)
     return con
 
@@ -78,7 +86,7 @@ def labels(widget):
 
 @pytest.fixture(scope="module")
 def plugin():
-    return NM.VpnEditorPlugin.load(os.path.join(PLUGIN_DIR, "libnm-vpn-plugin-openvpn3.so"), SERVICE)
+    return nmjson.load_plugin()
 
 
 def test_editor_shows_and_saves(plugin):
@@ -100,25 +108,37 @@ def test_editor_shows_and_saves(plugin):
     assert editor.update_connection(out)
     s_vpn = out.get_setting_vpn()
     assert s_vpn.get_data_item("username") == "otheruser"
-    assert base64.b64decode(s_vpn.get_data_item("profile")).decode() == PROFILE
+    assert base64.b64decode(s_vpn.get_secret("profile")).decode() == PROFILE
     assert s_vpn.get_data_item("password-flags") == "1"
     assert s_vpn.get_secret("password") is None
 
 
 def test_editor_requires_a_profile(plugin):
-    con = connection()
+    con = connection(legacy=True)
     con.get_setting_vpn().remove_data_item("profile")
     editor = plugin.get_editor(con)
+    assert "No profile loaded yet" in labels(editor.get_widget())
     with pytest.raises(gi.repository.GLib.Error):
+        editor.update_connection(connection())
+
+
+def test_editor_without_secret_profile_does_not_save(plugin):
+    con = connection()
+    con.get_setting_vpn().remove_secret("profile")
+    editor = plugin.get_editor(con)
+    assert "The profile is stored as a secret and was not provided" in labels(editor.get_widget())
+    with pytest.raises(gi.repository.GLib.Error, match="stored as a secret"):
         editor.update_connection(connection())
 
 
 def test_editor_key_passphrase_for_pkcs12(plugin):
     con = connection()
     s_vpn = con.get_setting_vpn()
-    s_vpn.add_data_item("profile", base64.b64encode(
+    s_vpn.add_secret("profile", base64.b64encode(
         b"client\nremote vpn.example.net\n<pkcs12>\nAAAA\n</pkcs12>\n").decode())
     s_vpn.remove_data_item("password-flags")
+    s_vpn.remove_data_item("username")
+    s_vpn.add_data_item("cert-pass-flags", "1")
     editor = plugin.get_editor(con)
     user, password, cert_pass = entries(editor.get_widget())
     assert cert_pass.get_visible() and not user.get_visible()

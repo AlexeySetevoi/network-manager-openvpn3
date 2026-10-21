@@ -9,6 +9,10 @@ moved into the connection's username/password.
 import shlex
 from dataclasses import dataclass
 
+# Directives naming a file; the import inlines them.
+FILE_DIRECTIVES = ("ca", "cert", "key", "extra-certs", "tls-auth", "tls-crypt", "tls-crypt-v2",
+                   "crl-verify", "pkcs12")
+
 
 @dataclass(frozen=True)
 class StaticChallenge:
@@ -16,8 +20,12 @@ class StaticChallenge:
     echo: bool
 
 
-def _directives(text):
-    """Yield (name, args) for every directive outside inline <tag> blocks."""
+def directives(text):
+    """Yield (name, args, inline) for every directive outside inline <tag> blocks.
+
+    An inline block yields its tag with inline=True. Directives inside a
+    <connection> block count: openvpn3 takes the remote from there.
+    """
     inline_tag = None
     for raw in text.splitlines():
         line = raw.strip()
@@ -25,25 +33,25 @@ def _directives(text):
             if line == f"</{inline_tag}>":
                 inline_tag = None
             continue
-        if not line or line[0] in "#;":
+        if not line or line[0] in "#;" or line in ("<connection>", "</connection>"):
             continue
         if line.startswith("<") and line.endswith(">") and not line.startswith("</"):
             inline_tag = line[1:-1]
-            yield inline_tag, []
+            yield inline_tag, [], True
             continue
         try:
             parts = shlex.split(line, comments=False)
         except ValueError:
             parts = line.split()
-        yield parts[0], parts[1:]
+        yield parts[0], parts[1:], False
 
 
 def needs_user_pass(text):
-    return any(name == "auth-user-pass" for name, _ in _directives(text))
+    return any(name == "auth-user-pass" for name, _, _ in directives(text))
 
 
 def static_challenge(text):
-    for name, args in _directives(text):
+    for name, args, _ in directives(text):
         if name == "static-challenge" and args:
             echo = len(args) > 1 and args[1] == "1"
             return StaticChallenge(args[0], echo)
@@ -52,7 +60,7 @@ def static_challenge(text):
 
 def first_remote(text):
     """Return (host, port) of the first remote, port may be None."""
-    for name, args in _directives(text):
+    for name, args, _ in directives(text):
         if name == "remote" and args:
             return args[0], (args[1] if len(args) > 1 else None)
     return None

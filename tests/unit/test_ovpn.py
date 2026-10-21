@@ -37,3 +37,8 @@ def test_static_challenge():
     sc = ovpn.static_challenge(PROFILE)
     assert sc == ovpn.StaticChallenge("Enter OTP", True)
     assert ovpn.static_challenge("client\n") is None
+
+
+def test_remote_inside_connection_block():
+    text = "client\n<connection>\nremote vpn1.example.net 1194\n</connection>\n"
+    assert ovpn.first_remote(text) == ("vpn1.example.net", "1194")

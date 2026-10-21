@@ -1,0 +1,42 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Adds a connection a conformance driver wrote (JSON) to NetworkManager.
+
+Usage: add-json-connection <file.json>
+"""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(HERE, "..", "..", "src"), os.path.join(HERE, "..", "harness")]
+
+import gi  # noqa: E402
+
+gi.require_version("NM", "1.0")
+from gi.repository import GLib, NM  # noqa: E402
+
+import nmjson  # noqa: E402
+
+con = nmjson.read(sys.argv[1])
+for setting, method in ((NM.SettingIP4Config, "auto"), (NM.SettingIP6Config, "auto")):
+    s = setting.new()
+    s.set_property(NM.SETTING_IP_CONFIG_METHOD, method)
+    con.add_setting(s)
+loop, errors = GLib.MainLoop(), []
+
+
+def done(client, res):
+    try:
+        client.add_connection2_finish(res)
+    except GLib.Error as e:
+        errors.append(e)
+    loop.quit()
+
+
+client = NM.Client.new(None)
+client.add_connection2(con.to_dbus(NM.ConnectionSerializationFlags.ALL),
+                       NM.SettingsAddConnection2Flags.TO_DISK, None, False, None, done)
+loop.run()
+if errors:
+    raise errors[0]

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 project('network-manager-openvpn3', 'c',
-  version: '0.1.0',
+  version: '0.2.0',
   license: 'GPL-2.0-or-later',
   meson_version: '>= 1.0',
   default_options: ['c_std=gnu11', 'warning_level=2'])
@@ -36,35 +36,33 @@ install_subdir('src/nm_openvpn3', install_dir: pkgdatadir,
 configure_file(input: 'auth-dialog/nm-openvpn3-auth-dialog.in', output: 'nm-openvpn3-auth-dialog',
   configuration: conf, install_dir: libexecdir, install_mode: 'rwxr-xr-x')
 
-# libnm plugin (no GTK)
-import_lib = static_library('ovpn-import', 'properties/ovpn-import.c',
+# Moves profiles of existing connections into the secrets (package upgrade).
+configure_file(input: 'src/service/nm-openvpn3-migrate.in', output: 'nm-openvpn3-migrate',
+  configuration: conf, install_dir: libexecdir, install_mode: 'rwxr-xr-x')
+
+# libnm plugin (no GTK): import/export and the connection format.
+plugin_inc = include_directories('libnm-plugin')
+import_lib = static_library('ovpn-import', 'libnm-plugin/ovpn-import.c',
   dependencies: libnm, pic: true)
 
-shared_module('nm-vpn-plugin-openvpn3', 'properties/nm-openvpn3-editor-plugin.c',
+shared_module('nm-vpn-plugin-openvpn3', 'libnm-plugin/nm-openvpn3-editor-plugin.c',
   name_prefix: 'lib',
   link_with: import_lib,
   dependencies: [libnm, gmodule, dl],
-  link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'properties/plugin.ver'],
+  link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'libnm-plugin/plugin.ver'],
   install: true, install_dir: plugindir)
 
-# Editors: GTK 4 for GNOME Settings, GTK 3 for nm-connection-editor.
-editors = [
-  ['gnome', 'nm-gtk4-vpn-plugin-openvpn3-editor', ['gtk4', '>= 4.10'], 'libnma-gtk4'],
-  ['gtk3', 'nm-vpn-plugin-openvpn3-editor', ['gtk+-3.0', '>= 3.22'], 'libnma'],
-]
-foreach e : editors
-  if get_option(e[0])
-    shared_module(e[1], 'properties/nm-openvpn3-editor.c',
-      name_prefix: 'lib',
-      link_with: import_lib,
-      dependencies: [libnm, dependency(e[2][0], version: e[2][1]), dependency(e[3], version: '>= 1.10')],
-      link_args: ['-Wl,--version-script=' + meson.current_source_dir() / 'properties/editor.ver'],
-      install: true, install_dir: plugindir)
-  endif
-endforeach
-
 pytest = find_program('pytest-3', 'pytest', required: false)
+conformance = find_program('scripts/conformance')
+test_env = ['OPENVPN3_PLUGIN_DIR=' + meson.current_build_dir(),
+  'OPENVPN3_EDITOR_DIR=' + meson.current_build_dir() / 'frontends' / 'gtk']
 if pytest.found()
   test('unit', pytest, args: ['-q', '-p', 'no:cacheprovider', meson.current_source_dir() / 'tests' / 'unit'],
-    env: ['OPENVPN3_PLUGIN_DIR=' + meson.current_build_dir()])
+    env: test_env)
+  test('conformance-core', conformance,
+    args: [meson.current_source_dir() / 'tests' / 'conformance' / 'drivers' / 'core'],
+    env: test_env)
 endif
+
+# Front-ends: each one is a subdir with its own options and package.
+subdir('frontends/gtk')

@@ -1,0 +1,65 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Reference conformance driver: the core alone, the way nmcli imports and edits.
+
+Also the example for front-end authors, see docs/frontends.md. A driver
+loads and edits connections the way its front-end does and exchanges them
+as JSON (tests/harness/nmjson.py).
+"""
+
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(HERE, "..", "..", "..", "src"), os.path.join(HERE, "..", "..", "harness")]
+
+import nmjson  # noqa: E402
+from nm_openvpn3 import connection as fmt  # noqa: E402
+from nm_openvpn3 import migrate  # noqa: E402
+
+STORAGE = {"system": 0, "agent": 1, "ask": 2, "none": 4}
+
+
+def capabilities():
+    print(json.dumps({"name": "core (nmcli)", "secret-storage": list(STORAGE),
+                      "agent-profile": True, "secrets": False}))
+
+
+def load(profile, out):
+    nmjson.write(nmjson.load_plugin().import_(profile), out)
+
+
+def edit(inp, changes_path, out):
+    con = nmjson.read(inp)
+    s_vpn = con.get_setting_vpn()
+    with open(changes_path) as f:
+        changes = json.load(f)
+    if migrate.needs_migration(s_vpn):
+        migrate.move_profile(s_vpn)
+    if "username" in changes:
+        if changes["username"]:
+            s_vpn.add_data_item(fmt.KEY_USERNAME, changes["username"])
+        else:
+            s_vpn.remove_data_item(fmt.KEY_USERNAME)
+    for key in (fmt.KEY_PASSWORD, fmt.KEY_CERT_PASS):
+        change = changes.get(key)
+        if change is None:
+            continue
+        if "storage" in change:
+            s_vpn.add_data_item(fmt.flags_key(key), str(STORAGE[change["storage"]]))
+        flags = int(s_vpn.get_data_item(fmt.flags_key(key)) or 0)
+        if flags in (0, 1) and change.get("value"):
+            s_vpn.add_secret(key, change["value"])
+        else:
+            s_vpn.remove_secret(key)
+    nmjson.write(con, out)
+
+
+def main():
+    cmd, args = sys.argv[1], sys.argv[2:]
+    {"capabilities": capabilities, "load": load, "edit": edit}[cmd](*args)
+
+
+if __name__ == "__main__":
+    main()

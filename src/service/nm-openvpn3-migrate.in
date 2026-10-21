@@ -1,0 +1,11 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Moves profiles of older openvpn3 connections into their secrets. Run by the package."""
+
+import sys
+
+sys.path.insert(0, "@pkgdatadir@")
+
+from nm_openvpn3.migrate import main  # noqa: E402
+
+sys.exit(main())

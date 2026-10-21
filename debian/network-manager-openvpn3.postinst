@@ -16,4 +16,15 @@ if [ "$1" = configure ] && [ -z "$2" ] \
     chmod 644 /var/lib/openvpn3/netcfg.json
 fi
 
+# Before 0.2.0 the profile, private key and all, was connection data any
+# local user could read; move it into the connection secrets.
+if [ "$1" = configure ] && [ -n "$2" ] && dpkg --compare-versions "$2" lt 0.2.0; then
+    if nmcli -t general status >/dev/null 2>&1; then
+        /usr/libexec/nm-openvpn3-migrate
+    else
+        echo "NetworkManager is not running: run /usr/libexec/nm-openvpn3-migrate once it is" \
+             "to move openvpn3 profiles into the connection secrets."
+    fi
+fi
+
 #DEBHELPER#

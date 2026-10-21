@@ -1,0 +1,21 @@
+{
+  "data": {
+    "challenge-response-flags": "2",
+    "password-flags": "1",
+    "profile-flags": "0",
+    "remote": "vpn.example.net"
+  },
+  "secrets": {
+    "profile": [
+      "client",
+      "remote vpn.example.net 1194",
+      "auth-user-pass",
+      "<ca>",
+      "-----BEGIN CERTIFICATE-----",
+      "MIIBsyntheticTESTCA",
+      "-----END CERTIFICATE-----",
+      "</ca>"
+    ]
+  },
+  "service-type": "org.freedesktop.NetworkManager.openvpn3"
+}

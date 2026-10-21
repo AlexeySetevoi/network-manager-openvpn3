@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 import base64
+import logging
 
 import gi
 import pytest
@@ -7,14 +8,16 @@ import pytest
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
-from nm_openvpn3 import ipconfig, service  # noqa: E402
+from nm_openvpn3 import service  # noqa: E402
 from nm_openvpn3 import openvpn3 as ov3  # noqa: E402
+from fake_openvpn3 import SESSION_PATH, USERPASS, fake_snapshot, log, start, status  # noqa: E402
 
 PROFILE = "client\ndev tun\nremote vpn.example.net 1194\nauth-user-pass\n"
-SESSION_PATH = "/net/openvpn/v3/sessions/test0"
 
 
-def make_connection(password="s3cret", username="testuser", config=PROFILE, cert_pass=None):
+def make_connection(password="s3cret", username="testuser", config=PROFILE, cert_pass=None,
+                    profile_flags="0"):
+    """profile_flags None: the layout before 0.2.0, the profile in vpn.data."""
     con = NM.SimpleConnection.new()
     s_con = NM.SettingConnection.new()
     s_con.set_property(NM.SETTING_CONNECTION_ID, "test-vpn")
@@ -22,7 +25,15 @@ def make_connection(password="s3cret", username="testuser", config=PROFILE, cert
     con.add_setting(s_con)
     s_vpn = NM.SettingVpn.new()
     s_vpn.set_property(NM.SETTING_VPN_SERVICE_TYPE, service.SERVICE_NAME)
-    s_vpn.add_data_item(service.KEY_PROFILE, base64.b64encode(config.encode()).decode())
+    encoded = base64.b64encode(config.encode()).decode()
+    if profile_flags is None:
+        s_vpn.add_data_item(service.KEY_PROFILE, encoded)
+    else:
+        s_vpn.add_data_item(service.KEY_PROFILE_FLAGS, profile_flags)
+        if encoded:
+            s_vpn.add_secret(service.KEY_PROFILE, encoded)
+    if "auth-user-pass" in config:
+        s_vpn.add_data_item("password-flags", "0")
     if username:
         s_vpn.add_data_item(service.KEY_USERNAME, username)
     if password:
@@ -33,129 +44,9 @@ def make_connection(password="s3cret", username="testuser", config=PROFILE, cert
     return con
 
 
-class FakeBus:
-    def __init__(self):
-        self.handlers = {}
-
-    def signal_subscribe(self, _svc, _iface, member, _path, _arg0, _flags, cb):
-        sid = len(self.handlers) + 1
-        self.handlers[sid] = (member, cb)
-        return sid
-
-    def signal_unsubscribe(self, sid):
-        del self.handlers[sid]
-
-    def emit(self, member, path, params):
-        for m, cb in list(self.handlers.values()):
-            if m == member:
-                cb(None, None, path, None, member, params)
-
-
-class FakeSession:
-    def __init__(self, client):
-        self.client = client
-        self.path = SESSION_PATH
-        self.calls = []
-        self.inputs = []
-        self.provided = {}
-        self.need_creds = False
-
-    def prop(self, name):
-        return {"status": (ov3.MAJOR_SESSION, ov3.SESS_NEW, ""),
-                "device_name": "tun7",
-                "connected_to": ("tcp", "203.0.113.10", 1194)}[name]
-
-    def log_forward(self, enable):
-        pass
-
-    def ready(self):
-        self.calls.append("ready")
-        if self.need_creds and len(self.provided) < len(self.inputs):
-            raise GLib.Error.new_literal(GLib.quark_from_string("test"),
-                                         "net.openvpn.v3.error.ready: Missing user credentials", 1)
-
-    def connect(self):
-        self.calls.append("connect")
-
-    def disconnect(self):
-        self.calls.append("disconnect")
-
-    def pending_inputs(self):
-        return [s for s in self.inputs if s[2] not in self.provided]
-
-    def provide(self, t, g, i, value):
-        self.provided[i] = value
-
-
-class FakeClient:
-    def __init__(self):
-        self.bus = FakeBus()
-        self.session = FakeSession(self)
-        self.imported = []
-
-    def import_config(self, name, text):
-        self.imported.append((name, text))
-        return "/net/openvpn/v3/configuration/cfg0"
-
-    def new_tunnel(self, _path):
-        return self.session
-
-    def netcfg_dns(self, _device):
-        return ["192.0.2.53"], ["corp.example.com"]
-
-
-class FakePlugin:
-    """Mirrors VpnPlugin: failure() and disconnect() end in the tunnel's stop()."""
-
-    def __init__(self):
-        self.events = []
-        self.tunnel = None
-
-    def set_config(self, v):
-        self.events.append(("config", v.unpack()))
-
-    def set_ip4_config(self, v):
-        self.events.append(("ip4", v.unpack()))
-
-    def set_ip6_config(self, v):
-        self.events.append(("ip6", v.unpack()))
-
-    def failure(self, reason):
-        self.events.append(("failure", reason))
-        self.tunnel.stop()
-
-    def disconnect(self):
-        self.events.append(("disconnect",))
-        self.tunnel.stop()
-
-    def request_secrets(self, message, hints):
-        self.events.append(("secrets", message, hints))
-
-
 @pytest.fixture(autouse=True)
-def fake_snapshot(monkeypatch):
-    def snap(device, dns, domains):
-        return ipconfig.TunnelState(
-            device, 1400,
-            ipconfig.FamilyConfig("198.51.100.6", 24, [], False, dns),
-            ipconfig.FamilyConfig(), domains)
-    monkeypatch.setattr(ipconfig, "snapshot", snap)
-
-
-def start(con, interactive=False):
-    client, plugin = FakeClient(), FakePlugin()
-    t = service.Tunnel(plugin, client, con, interactive)
-    plugin.tunnel = t
-    t.start()
-    return t, client, plugin
-
-
-def status(client, major, minor, msg=""):
-    client.bus.emit("StatusChange", SESSION_PATH, GLib.Variant("(uus)", (major, minor, msg)))
-
-
-USERPASS = [(ov3.ATTN_CREDENTIALS, ov3.GRP_USER_PASSWORD, 0, "username", "Auth User name", False),
-            (ov3.ATTN_CREDENTIALS, ov3.GRP_USER_PASSWORD, 1, "password", "Auth Password", True)]
+def snapshot(monkeypatch):
+    fake_snapshot(monkeypatch)
 
 
 def test_connect_flow_reports_config():
@@ -343,3 +234,77 @@ def test_pk_passphrase_slot_is_answered():
     client.session.need_creds = True
     status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
     assert client.session.provided == {0: "testuser", 1: "s3cret", 2: "keypass"}
+
+
+def test_legacy_profile_in_data_still_connects():
+    t, client, plugin = start(make_connection(profile_flags=None))
+    assert client.imported == [("test-vpn", PROFILE)]
+
+
+def test_secret_profile_wins_over_stale_data_copy():
+    con = make_connection()
+    con.get_setting_vpn().add_data_item(service.KEY_PROFILE, base64.b64encode(b"stale").decode())
+    t, client, plugin = start(con)
+    assert client.imported == [("test-vpn", PROFILE)]
+
+
+def test_need_secrets_asks_agent_for_agent_owned_profile():
+    con = make_connection(config="", profile_flags="1")
+    assert service.Plugin.do_need_secrets(None, con) == NM.SETTING_VPN_SETTING_NAME
+
+
+def test_need_secrets_without_system_profile_is_an_error():
+    con = make_connection(config="", profile_flags="0")
+    with pytest.raises(service.PluginError, match="stored as a secret"):
+        service.Plugin.do_need_secrets(None, con)
+
+
+def test_invalid_profile_flags_are_rejected():
+    with pytest.raises(service.PluginError, match="would never store"):
+        service.Plugin.do_need_secrets(None, make_connection(profile_flags="2"))
+
+
+def test_new_secrets_without_profile_keep_the_session():
+    t, client, plugin = start(make_connection(), interactive=True)
+    client.session.inputs = list(USERPASS) + [
+        (ov3.ATTN_CREDENTIALS, ov3.GRP_CHALLENGE_DYNAMIC, 2, "dynamic_challenge", "Enter PIN", False)]
+    client.session.need_creds = True
+    status(client, ov3.MAJOR_CONNECTION, ov3.CFG_REQUIRE_USER)
+    con = make_connection(config="")
+    con.get_setting_vpn().add_secret(service.KEY_CHALLENGE, "123456")
+    t.new_secrets(con)
+    assert t.config == PROFILE
+    assert client.session.calls[-1] == "connect"
+
+
+def test_session_expiry_is_the_reason(caplog):
+    caplog.set_level(logging.INFO)
+    t, client, plugin = start(make_connection())
+    status(client, ov3.MAJOR_CONNECTION, ov3.CONN_CONNECTED)
+    log(client, "[SESSION_EXPIRED] ")
+    log(client, "Disconnected")
+    status(client, ov3.MAJOR_CONNECTION, ov3.CONN_DISCONNECTED)
+    assert plugin.events[-1] == ("disconnect",)
+    assert "session expired" in caplog.text
+    # The backend is gone: no Disconnect call on it.
+    assert "disconnect" not in client.session.calls
+
+
+def test_stop_while_connecting_says_where_it_was(caplog):
+    caplog.set_level(logging.INFO)
+    t, client, plugin = start(make_connection())
+    status(client, ov3.MAJOR_CONNECTION, ov3.CONN_CONNECTING)
+    log(client, "Opening https://vpn.example.net/auth?state=secret-token")
+    caplog.clear()
+    t.stop()
+    assert "status 2/6" in caplog.text and "vpn.example.net" in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+def test_login_again_during_session_is_logged(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setattr(service.desktop, "open_url", lambda url: "testuser")
+    t, client, plugin = start(make_connection())
+    status(client, ov3.MAJOR_CONNECTION, ov3.CONN_CONNECTED)
+    status(client, ov3.MAJOR_SESSION, ov3.SESS_AUTH_URL, "https://vpn.example.net/auth")
+    assert "log in again" in caplog.text

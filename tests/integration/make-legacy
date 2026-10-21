@@ -1,0 +1,30 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Turns a connection back into the layout before 0.2.0 (profile in vpn.data).
+
+Usage: make-legacy <connection id>
+"""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "..", "src"))
+
+import gi  # noqa: E402
+
+gi.require_version("NM", "1.0")
+from gi.repository import NM  # noqa: E402
+
+from nm_openvpn3 import migrate  # noqa: E402
+
+# Keep the client: its connections drop out of its cache once it is gone.
+client = NM.Client.new(None)
+con = next(c for c in client.get_connections() if c.get_id() == sys.argv[1])
+migrate._fetch_secrets(con)
+s_vpn = con.get_setting_vpn()
+s_vpn.add_data_item("profile", s_vpn.get_secret("profile"))
+s_vpn.remove_secret("profile")
+s_vpn.remove_data_item("profile-flags")
+s_vpn.remove_data_item("remote")
+migrate._save(con)

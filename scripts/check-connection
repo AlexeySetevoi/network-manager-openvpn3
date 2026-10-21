@@ -1,0 +1,64 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Checks an openvpn3 connection against docs/connection-format.md.
+
+Usage: scripts/check-connection <UUID or name | file.nmconnection | file.json>
+
+A live connection is read from NetworkManager, with its secrets when the
+caller may read them (root); without them a system-owned profile cannot be
+checked. Exits 1 when the connection does not conform.
+"""
+
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(HERE, "..", "src"), os.path.join(HERE, "..", "tests", "harness")]
+
+import gi  # noqa: E402
+
+gi.require_version("NM", "1.0")
+from gi.repository import GLib, NM  # noqa: E402
+
+import nmjson  # noqa: E402
+from nm_openvpn3 import connection as fmt  # noqa: E402
+
+
+def from_nm(ref):
+    client = NM.Client.new(None)
+    con = client.get_connection_by_uuid(ref) or next(
+        (c for c in client.get_connections() if c.get_id() == ref), None)
+    if con is None:
+        sys.exit(f"no connection {ref!r}")
+    try:
+        con.update_secrets(NM.SETTING_VPN_SETTING_NAME, con.get_secrets(NM.SETTING_VPN_SETTING_NAME, None))
+    except GLib.Error as e:
+        # Designed mode: not allowed to read secrets, check the rest.
+        print(f"secrets not readable ({e.message}), checking without them")
+        return con, False
+    return con, True
+
+
+def from_file(path):
+    if path.endswith(".json"):
+        return nmjson.read(path), True
+    kf = GLib.KeyFile()
+    kf.load_from_file(path, GLib.KeyFileFlags.NONE)
+    return NM.keyfile_read(kf, os.path.dirname(os.path.abspath(path)), NM.KeyfileHandlerFlags.NONE, None, None), True
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.exit(__doc__)
+    ref = sys.argv[1]
+    con, with_secrets = from_file(ref) if os.path.exists(ref) else from_nm(ref)
+    problems = fmt.validate(con.get_setting_vpn(), with_secrets=with_secrets)
+    for p in problems:
+        print(f"{con.get_id()}: {p}")
+    if not problems:
+        print(f"{con.get_id()}: conforms")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

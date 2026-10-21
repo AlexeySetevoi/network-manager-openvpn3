@@ -9,8 +9,6 @@ dialog asks and the secrets are written to stdout as key/value lines.
 """
 
 import argparse
-import base64
-import binascii
 import os
 import sys
 import time
@@ -22,31 +20,28 @@ sys.path.insert(0, "@pkgdatadir@")
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
+from nm_openvpn3 import connection as fmt  # noqa: E402
 from nm_openvpn3 import pki  # noqa: E402
 
-KEY_PASSWORD = "password"
-KEY_CHALLENGE = "challenge-response"
-KEY_CERT_PASS = "cert-pass"
+KEY_PROFILE = fmt.KEY_PROFILE
+KEY_PASSWORD = fmt.KEY_PASSWORD
+KEY_CHALLENGE = fmt.KEY_CHALLENGE
+KEY_CERT_PASS = fmt.KEY_CERT_PASS
 HINT_MESSAGE = "x-vpn-message:"
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
 
-def decode_profile(profile_b64):
+def read_profile(data, secrets):
     try:
-        return base64.b64decode(profile_b64 or "", validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        return None
+        return fmt.read_profile(data.get, secrets.get)
+    except fmt.FormatError:
+        return None  # the service reports it
 
 
-def needs_user_pass(config):
+def needs_cert_pass(data, config):
     if config is None:
-        return True  # cannot tell: ask rather than fail silently
-    return any(line.strip() == "auth-user-pass" for line in config.splitlines())
-
-
-def needs_cert_pass(config):
-    if config is None:
-        return False
+        # Not provided to us: the connection says whether there is a key passphrase.
+        return fmt.needs_cert_pass(data.get)
     try:
         return pki.needs_passphrase(config)
     except pki.InvalidBundle:
@@ -55,8 +50,8 @@ def needs_cert_pass(config):
 
 def secret_flags(data, key):
     try:
-        return NM.SettingSecretFlags(int(data.get(key + "-flags", "0")))
-    except ValueError:
+        return fmt.secret_flags(data.get, key)
+    except fmt.FormatError:
         return NM.SettingSecretFlags.NONE
 
 
@@ -99,10 +94,10 @@ def plan(data, secrets, hints, retry):
         # The service found the stored passphrase wrong or missing.
         return message, [Field(KEY_CERT_PASS, "Private key passphrase", "", True)]
 
-    config = decode_profile(data.get("profile"))
+    config = read_profile(data, secrets)
     fields = []
-    for key, label, needed in ((KEY_PASSWORD, "Password", needs_user_pass(config)),
-                               (KEY_CERT_PASS, "Private key passphrase", needs_cert_pass(config))):
+    for key, label, needed in ((KEY_PASSWORD, "Password", fmt.needs_user_pass(data.get)),
+                               (KEY_CERT_PASS, "Private key passphrase", needs_cert_pass(data, config))):
         flags = secret_flags(data, key)
         if not needed or flags & NM.SettingSecretFlags.NOT_REQUIRED:
             continue
@@ -221,6 +216,9 @@ def main():
         return
 
     values = {f.key: f.value for f in fields if f.value}
+    # An agent-owned profile goes back with the answer.
+    if secrets.get(KEY_PROFILE):
+        values[KEY_PROFILE] = secrets[KEY_PROFILE]
     if any(f.should_ask for f in fields):
         if not args.allow_interaction:
             sys.exit(1)

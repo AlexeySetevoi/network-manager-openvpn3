@@ -35,7 +35,6 @@ Depends: ${shlibs:Depends},
          iproute2,
          libglib2.0-bin,
          systemd
-Recommends: gir1.2-gtk-4.0
 Suggests: network-manager-openvpn3-gnome
 Description: network management framework (OpenVPN 3 plugin core)
  NetworkManager is a system network service that manages your network
@@ -44,19 +43,22 @@ Description: network management framework (OpenVPN 3 plugin core)
  so openvpn3 profiles show up in the desktop's standard VPN menu and in
  nmcli.
  .
- This package contains the NetworkManager service, the libnm plugin
- used by nmcli to import and export OpenVPN profiles and the dialog that
- asks for passwords and one-time codes.
+ This package contains the desktop-independent core: the NetworkManager
+ service, the libnm plugin used by nmcli and the desktop editors to import
+ and export OpenVPN profiles, and the helper secret agents run to learn
+ which passwords and one-time codes to ask for.
 
 Package: network-manager-openvpn3-gnome
 Architecture: any
 Depends: ${shlibs:Depends},
          ${misc:Depends},
-         network-manager-openvpn3 (= ${binary:Version})
+         network-manager-openvpn3 (= ${binary:Version}),
+         gir1.2-gtk-4.0
 Description: network management framework (OpenVPN 3 plugin GNOME GUI)
  NetworkManager is a system network service that manages your network
  devices and connections. This package lets NetworkManager start and
  stop VPN connections through the OpenVPN 3 Linux client (openvpn3).
  .
  This package contains the connection editors: GTK 4 for GNOME Settings
- and GTK 3 for nm-connection-editor.
+ and GTK 3 for nm-connection-editor (also used on Xfce, MATE, Cinnamon and
+ other desktops running nm-applet), and the password dialog nm-applet shows.

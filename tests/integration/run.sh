@@ -6,6 +6,8 @@
 # machine (VM or CI runner) with systemd. All data is synthetic.
 #
 # Usage: run.sh <dir with .deb files>
+# FRONTEND_DRIVER=<conformance driver>: profiles are loaded through that
+# front-end (docs/frontends.md) instead of nmcli import.
 set -euo pipefail
 
 DEBS=${1:?usage: run.sh <deb dir>}
@@ -18,6 +20,8 @@ PUSHED_ROUTE=203.0.113.0/24
 PUSHED_DNS=192.0.2.53
 PUSHED_DOMAIN=corp.example.com
 CON=it-test
+HERE=$(cd "$(dirname "$0")" && pwd)
+NOBODY=it-nobody
 
 log() { printf '\n=== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; dump; exit 1; }
@@ -30,6 +34,15 @@ wait_for() { # wait_for <seconds> <description> <command...>
   local t=$1 what=$2; shift 2
   for _ in $(seq "$t"); do "$@" && return 0; sleep 1; done
   fail "timed out waiting for: $what"
+}
+
+import_profile() { # import_profile <file.ovpn>
+  if [ -n "${FRONTEND_DRIVER:-}" ]; then
+    "$FRONTEND_DRIVER" load "$1" "$WORK/load.json"
+    "$HERE/add-json-connection" "$WORK/load.json"
+  else
+    nmcli connection import type openvpn3 file "$1"
+  fi
 }
 
 con_state() { nmcli -g GENERAL.STATE connection show "$1" 2>/dev/null || :; }
@@ -173,7 +186,7 @@ base_connection() {
 test_connect() {
   log "Import and connect"
   write_profile "$WORK/$CON.ovpn" testpass
-  nmcli connection import type openvpn3 file "$WORK/$CON.ovpn"
+  import_profile "$WORK/$CON.ovpn"
   nmcli connection up "$CON" || fail "nmcli connection up failed"
   wait_for 30 "activated" is_activated "$CON"
   local dev; dev=$(tun_dev)
@@ -190,6 +203,40 @@ test_connect() {
   nmcli -g IP4.DNS connection show "$CON" | grep -q "$PUSHED_DNS" || fail "NetworkManager does not know the DNS server"
   nmcli -g IP4.DOMAIN connection show "$CON" | grep -q "$PUSHED_DOMAIN" || fail "NetworkManager does not know the search domain"
   nmcli -f GENERAL.STATE,IP4.ADDRESS,IP4.ROUTE,IP4.DNS,IP4.DOMAIN connection show "$CON"
+}
+
+test_profile_is_private() {
+  log "The profile is a system-owned secret, other users cannot read it"
+  nmcli -g vpn.data connection show "$CON" | grep -q 'profile-flags = 0' || fail "profile is not a system-owned secret"
+  nmcli -g vpn.data connection show "$CON" | grep -qE '(^|, )profile = ' && fail "profile is in vpn.data"
+  id "$NOBODY" >/dev/null 2>&1 || useradd -M -s /usr/sbin/nologin "$NOBODY"
+  # A fresh user outside the desktop session, as polkit sees a real one.
+  local out
+  out=$(systemd-run --quiet --wait --pipe --uid="$NOBODY" nmcli -s -g vpn.data,vpn.secrets connection show "$CON")
+  grep -q 'BEGIN CERTIFICATE\|profile = ' <<<"$out" && fail "another user can read the profile"
+  return 0
+}
+
+test_export() {
+  log "Export: nmcli passes no secrets, the plugin reads the profile itself"
+  printf 'old' > "$WORK/export.ovpn"
+  chmod 644 "$WORK/export.ovpn"
+  nmcli connection export "$CON" "$WORK/export.ovpn" || fail "export failed"
+  [ "$(stat -c %a "$WORK/export.ovpn")" = 600 ] || fail "exported profile is not 0600"
+  grep -q '^remote 127.0.0.1 1194' "$WORK/export.ovpn" || fail "exported profile is incomplete"
+  grep -q testpass "$WORK/export.ovpn" && fail "exported profile contains the password"
+  return 0
+}
+
+test_migration() {
+  log "A connection in the layout before 0.2.0 is moved and still connects"
+  "$HERE/make-legacy" "$CON"
+  nmcli -g vpn.data connection show "$CON" | grep -qE '(^|, )profile = ' || fail "could not make a legacy connection"
+  /usr/libexec/nm-openvpn3-migrate | grep -q "'$CON'" || fail "migration did not report $CON"
+  nmcli -g vpn.data connection show "$CON" | grep -q 'profile-flags = 0' || fail "migration did not move the profile"
+  # The system-owned password survived the move.
+  nmcli --wait 40 connection up "$CON" || fail "migrated connection does not connect"
+  wait_for 30 "activated" is_activated "$CON"
 }
 
 test_reconnect() {
@@ -217,7 +264,7 @@ test_disconnect() {
 test_bad_password() {
   log "Wrong password is reported as a login failure"
   write_profile "$WORK/it-bad.ovpn" wrongpass
-  nmcli connection import type openvpn3 file "$WORK/it-bad.ovpn"
+  import_profile "$WORK/it-bad.ovpn"
   local out
   if out=$(nmcli --wait 40 connection up it-bad 2>&1); then
     fail "connection with a wrong password came up"
@@ -231,7 +278,7 @@ test_bad_password() {
 test_agent_password() {
   log "Password from a secret agent (not stored in the connection)"
   write_profile "$WORK/it-agent.ovpn"
-  nmcli connection import type openvpn3 file "$WORK/it-agent.ovpn"
+  import_profile "$WORK/it-agent.ovpn"
   [ "$(nmcli -g vpn.data connection show it-agent | grep -o 'password-flags = [0-9]')" = "password-flags = 1" ] \
     || fail "imported password is not agent-owned"
   nmcli connection modify it-agent +vpn.data username=testuser
@@ -245,7 +292,7 @@ test_agent_password() {
 test_static_challenge() {
   log "One-time code (static challenge) asked through the secret agent"
   write_profile "$WORK/it-otp.ovpn" "" 'static-challenge "Enter OTP" 1'
-  nmcli connection import type openvpn3 file "$WORK/it-otp.ovpn"
+  import_profile "$WORK/it-otp.ovpn"
   nmcli connection modify it-otp +vpn.data username=testuser
   printf 'vpn.secrets.password:testpass\nvpn.secrets.challenge-response:424242\n' > "$WORK/secrets"
   nmcli --wait 40 connection up it-otp passwd-file "$WORK/secrets" || fail "static challenge flow failed"
@@ -263,7 +310,7 @@ test_client_certificates() {
   local name pass
   for name in it-p12:p12pass it-key:keypass; do
     pass=${name#*:}; name=${name%%:*}
-    nmcli connection import type openvpn3 file "$WORK/$name.ovpn"
+    import_profile "$WORK/$name.ovpn"
     [ "$(nmcli -g vpn.data connection show "$name" | grep -o 'cert-pass-flags = [0-9]')" = "cert-pass-flags = 1" ] \
       || fail "$name: key passphrase is not agent-owned"
     printf 'vpn.secrets.cert-pass:%s\n' "$pass" > "$WORK/secrets"
@@ -281,6 +328,7 @@ test_client_certificates() {
 
 cleanup() {
   nmcli connection delete "$CON" it-base >/dev/null 2>&1 || :
+  userdel "$NOBODY" 2>/dev/null || :
   systemctl stop openvpn-server@it openvpn-server@it2 2>/dev/null || :
   rm -f /etc/NetworkManager/conf.d/10-globally-managed-devices.conf
   rm -rf "$WORK" "$SRV" /etc/openvpn/server/it.conf /etc/openvpn/server/it2.conf /etc/openvpn/server/check-user.sh
@@ -291,6 +339,10 @@ make_pki
 start_server
 base_connection
 test_connect
+test_profile_is_private
+test_export
+test_disconnect
+test_migration
 test_reconnect
 test_disconnect
 test_bad_password

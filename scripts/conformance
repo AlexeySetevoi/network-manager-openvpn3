@@ -1,0 +1,18 @@
+#!/bin/sh
+# Front-end conformance suite (docs/frontends.md).
+# Usage: scripts/conformance <driver> [pytest options]
+# Uses the plugin from OPENVPN3_PLUGIN_DIR (a build tree) or the installed one.
+set -eu
+here=$(cd "$(dirname "$0")/.." && pwd)
+driver=$1
+shift
+# A driver exits 77 when it cannot run here (no display, say).
+rc=0
+"$driver" capabilities >/dev/null || rc=$?
+if [ "$rc" = 77 ]; then
+    echo "conformance: $driver cannot run here, skipped" >&2
+    exit 77
+fi
+[ "$rc" = 0 ] || exit "$rc"
+exec python3 -m pytest -q -p no:cacheprovider -c "$here/pytest.ini" --rootdir "$here/tests/conformance" \
+    --driver "$driver" "$here/tests/conformance" "$@"

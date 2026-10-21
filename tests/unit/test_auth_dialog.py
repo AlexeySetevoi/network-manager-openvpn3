@@ -47,9 +47,9 @@ def test_plan_asks_for_missing_password():
 
 
 def test_plan_keeps_saved_password_unless_reprompt():
-    _, fields = ad.plan({"profile": PROFILE}, {"password": "pw"}, [], False)
+    _, fields = ad.plan({"profile": PROFILE, "password-flags": "0"}, {"password": "pw"}, [], False)
     assert not fields[0].should_ask and fields[0].value == "pw"
-    _, fields = ad.plan({"profile": PROFILE}, {"password": "pw"}, [], True)
+    _, fields = ad.plan({"profile": PROFILE, "password-flags": "0"}, {"password": "pw"}, [], True)
     assert fields[0].should_ask
 
 
@@ -102,3 +102,18 @@ def test_plan_asks_for_key_passphrase():
 def test_plan_cert_pass_hint():
     _, fields = ad.plan({"profile": PROFILE}, {}, ["cert-pass"], False)
     assert [f.key for f in fields] == ["cert-pass"]
+
+
+def test_plan_reads_profile_from_secrets():
+    from pkihelp import pem_key
+    prof = base64.b64encode(f"client\nremote vpn.example.net\n<key>\n{pem_key(b'kp')}</key>\n".encode()).decode()
+    # No cert-pass-flags: the encrypted key in the agent's profile decides.
+    _, fields = ad.plan({"profile-flags": "1"}, {"profile": prof}, [], False)
+    assert [f.key for f in fields] == ["cert-pass"]
+
+
+def test_plan_without_profile_follows_flags():
+    # A system-owned profile is not handed to agents without permission.
+    _, fields = ad.plan({"profile-flags": "0", "password-flags": "1"}, {}, [], False)
+    assert [f.key for f in fields] == ["password"]
+    assert ad.plan({"profile-flags": "0"}, {}, [], False) == (None, [])

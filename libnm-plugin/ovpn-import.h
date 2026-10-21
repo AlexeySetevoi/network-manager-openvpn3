@@ -4,10 +4,15 @@
 
 #include <NetworkManager.h>
 
+/* Connection format: docs/connection-format.md. */
 #define OPENVPN3_SERVICE_TYPE "org.freedesktop.NetworkManager.openvpn3"
-/* The profile is stored base64-encoded: multi-line values do not survive
- * every NetworkManager settings backend (netplan escapes newlines twice). */
+/* The profile is a secret, stored base64-encoded: multi-line values do not
+ * survive every NetworkManager settings backend (netplan escapes newlines
+ * twice). Older connections have it in the data items, without flags. */
 #define OPENVPN3_KEY_PROFILE  "profile"
+#define OPENVPN3_KEY_PROFILE_FLAGS "profile-flags"
+/* First remote host, for display only. */
+#define OPENVPN3_KEY_REMOTE   "remote"
 #define OPENVPN3_KEY_USERNAME "username"
 #define OPENVPN3_KEY_PASSWORD "password"
 #define OPENVPN3_KEY_CHALLENGE "challenge-response"
@@ -34,9 +39,14 @@ Openvpn3Profile *openvpn3_profile_load(const char *path, GError **error);
 /* Builds a new VPN connection named after the file. */
 NMConnection *openvpn3_connection_from_profile(Openvpn3Profile *p, const char *id);
 
-/* Profile text stored in / read from a VPN setting; NULL when absent or invalid. */
+/* Profile text read from a VPN setting; NULL when absent or invalid. */
 char *openvpn3_setting_get_profile(NMSettingVpn *s_vpn);
-void  openvpn3_setting_set_profile(NMSettingVpn *s_vpn, const char *profile);
+/* Stores the profile as a secret with @flags, dropping an old data copy. */
+void openvpn3_setting_set_profile(NMSettingVpn *s_vpn, const char *profile, NMSettingSecretFlags flags);
+/* Whether the profile belongs in the secrets (it may not have been provided). */
+gboolean openvpn3_setting_profile_is_secret(NMSettingVpn *s_vpn);
+/* Flags of the profile secret; NONE for an old data copy. */
+NMSettingSecretFlags openvpn3_setting_get_profile_flags(NMSettingVpn *s_vpn);
 
 /* First remote host of a normalized profile, or NULL. */
 char *openvpn3_profile_remote(const char *config);

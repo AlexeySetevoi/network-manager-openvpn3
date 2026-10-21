@@ -1,0 +1,31 @@
+{
+  "data": {
+    "profile-flags": "0",
+    "remote": "vpn.example.net"
+  },
+  "secrets": {
+    "profile": [
+      "# Certificate only, everything inline.",
+      "client",
+      "dev tun",
+      "proto udp",
+      "remote vpn.example.net 1194",
+      "<ca>",
+      "-----BEGIN CERTIFICATE-----",
+      "MIIBsyntheticTESTCA",
+      "-----END CERTIFICATE-----",
+      "</ca>",
+      "<cert>",
+      "-----BEGIN CERTIFICATE-----",
+      "MIIBsyntheticTESTCLIENT",
+      "-----END CERTIFICATE-----",
+      "</cert>",
+      "<key>",
+      "-----BEGIN PRIVATE KEY-----",
+      "MIGHsyntheticTESTKEY",
+      "-----END PRIVATE KEY-----",
+      "</key>"
+    ]
+  },
+  "service-type": "org.freedesktop.NetworkManager.openvpn3"
+}

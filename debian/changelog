@@ -1,3 +1,20 @@
+network-manager-openvpn3 (0.2.0) unstable; urgency=medium
+
+  * Store the profile as a system-owned connection secret: before, any
+    local user could read the private key with nmcli. Existing connections
+    are moved on upgrade.
+  * Document the connection format and how to add a front-end for another
+    desktop, with a conformance suite front-ends run against the core.
+  * Split the sources into the core (libnm-plugin/) and the GTK front-end
+    (frontends/gtk/); the core package no longer pulls in GTK.
+  * Recognise remotes inside <connection> blocks.
+  * Write exported profiles with mode 0600.
+  * Say why a connection ended (e.g. the server expired the session), do
+    not disconnect a session openvpn3 already ended, log logins asked for
+    during a session and where a connection was when it was stopped.
+
+ -- AlexeySetevoi <17676189+AlexeySetevoi@users.noreply.github.com>  Wed, 21 Oct 2026 12:00:00 +0000
+
 network-manager-openvpn3 (0.1.0) unstable; urgency=medium
 
   * Web based login: open the server's login URL in the desktop user's

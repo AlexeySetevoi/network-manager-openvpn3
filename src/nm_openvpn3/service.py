@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """NetworkManager VPN service plugin driving OpenVPN 3 Linux sessions."""
 
-import base64
-import binascii
 import logging
+import re
 import urllib.parse
 
 import gi
@@ -11,6 +10,7 @@ import gi
 gi.require_version("NM", "1.0")
 from gi.repository import GLib, NM  # noqa: E402
 
+from . import connection as fmt  # noqa: E402
 from . import desktop, ipconfig, ovpn, pki  # noqa: E402
 from . import openvpn3 as ov3  # noqa: E402
 from .vpnplugin import PluginError, VpnPlugin  # noqa: E402
@@ -19,36 +19,46 @@ log = logging.getLogger("nm-openvpn3")
 
 SERVICE_NAME = "org.freedesktop.NetworkManager.openvpn3"
 
-# Base64: multi-line values do not survive every settings backend (netplan
-# escapes newlines twice).
-KEY_PROFILE = "profile"
-KEY_USERNAME = "username"
-KEY_PASSWORD = "password"
-KEY_CHALLENGE = "challenge-response"
-KEY_CERT_PASS = "cert-pass"
+KEY_PROFILE = fmt.KEY_PROFILE
+KEY_PROFILE_FLAGS = fmt.KEY_PROFILE_FLAGS
+KEY_USERNAME = fmt.KEY_USERNAME
+KEY_PASSWORD = fmt.KEY_PASSWORD
+KEY_CHALLENGE = fmt.KEY_CHALLENGE
+KEY_CERT_PASS = fmt.KEY_CERT_PASS
 
 HINT_CHALLENGE_ECHO = "x-challenge-echo"
 
+# openvpn3 reports client events in its log as "[NAME] info".
+_EVENT = re.compile(r"^\[([A-Z_]+)\]\s*(.*)$")
+_EVENT_TEXT = {
+    "SESSION_EXPIRED": "The server ended the session (session expired)",
+    "AUTH_FAILED": "Authentication failed",
+    "CONNECTION_TIMEOUT": "The server did not answer",
+}
+_URL = re.compile(r"https?://\S+")
+
 
 def get_profile(s_vpn):
-    value = s_vpn.get_data_item(KEY_PROFILE) if s_vpn else None
-    if not value:
-        return None
     try:
-        return base64.b64decode(value, validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
-        raise PluginError("BadArguments", "The stored OpenVPN profile is corrupt")
+        return fmt.setting_profile(s_vpn)
+    except fmt.FormatError as e:
+        raise PluginError("BadArguments", str(e))
+
+
+def _secret_flags(s_vpn, key):
+    try:
+        return fmt.secret_flags(s_vpn.get_data_item, key)
+    except fmt.FormatError as e:
+        raise PluginError("BadArguments", str(e))
 
 
 def _url_host(url):
     return urllib.parse.urlsplit(url).hostname or "?"
 
 
-def _secret_flags(s_vpn, key):
-    # NM.Setting.get_secret_flags() is not callable from Python (the out
-    # argument lacks an annotation); VPN secret flags live in the data items.
-    value = s_vpn.get_data_item(key + "-flags")
-    return NM.SettingSecretFlags(int(value)) if value else NM.SettingSecretFlags.NONE
+def _redact(text):
+    """Login URLs carry one-time tokens: keep only the host."""
+    return _URL.sub(lambda m: _url_host(m.group(0)), text)
 
 
 class Tunnel:
@@ -63,14 +73,19 @@ class Tunnel:
         self.connect_started = False
         self.connected_once = False
         self.stopping = False
+        self.failed = False
+        self.ended = False
         self._last_status = None
+        self._last_log = None
+        self._last_event = None
         self._sub_ids = []
+        self.name = connection.get_id()
+        # NewSecrets may come without the profile; it does not change anyway.
+        self.config = get_profile(connection.get_setting_vpn())
         self.update_connection(connection)
 
     def update_connection(self, connection):
         s_vpn = connection.get_setting_vpn()
-        self.name = connection.get_id()
-        self.config = get_profile(s_vpn)
         self.username = s_vpn.get_data_item(KEY_USERNAME)
         self.password = s_vpn.get_secret(KEY_PASSWORD)
         self.challenge = s_vpn.get_secret(KEY_CHALLENGE)
@@ -107,6 +122,7 @@ class Tunnel:
         # enabled; AttentionRequired is broadcast by the session manager.
         bus = self.client.bus
         for sender, iface, sig in ((ov3.LOG_SVC, ov3.BACKENDS_IF, "StatusChange"),
+                                   (ov3.LOG_SVC, ov3.BACKENDS_IF, "Log"),
                                    (ov3.SESSIONS_SVC, ov3.SESSIONS_SVC, "StatusChange"),
                                    (ov3.SESSIONS_SVC, ov3.SESSIONS_SVC, "AttentionRequired")):
             self._sub_ids.append(bus.signal_subscribe(sender, iface, sig, None, None,
@@ -121,7 +137,9 @@ class Tunnel:
         if self.stopping:
             return
         self.stopping = True
-        if self.session is not None:
+        if not self.failed and not self.connected_once:
+            log.info("stopped before connecting, %s", self._last_words())
+        if self.session is not None and not self.ended:
             try:
                 self.session.disconnect()
             except GLib.Error as e:
@@ -142,6 +160,8 @@ class Tunnel:
         try:
             if signal == "StatusChange":
                 self._on_status(*params.unpack())
+            elif signal == "Log":
+                self._on_log(params.unpack()[-1])
             elif signal == "AttentionRequired":
                 t, g, _msg = params.unpack()
                 log.info("attention required: type=%d group=%d", t, g)
@@ -150,6 +170,32 @@ class Tunnel:
             # user sees it instead of a connection stuck in "connecting".
             log.exception("handling %s failed", signal)
             self._fail(NM.VpnPluginFailure.CONNECT_FAILED, f"Internal error: {e}")
+
+    def _on_log(self, message):
+        # openvpn3-service-log already writes these to the journal; keep the
+        # last ones to say why a connection ended.
+        message = message.strip()
+        if not message:
+            return
+        self._last_log = message
+        if _EVENT.match(message):
+            self._last_event = message
+
+    def _last_words(self):
+        status = "status %d/%d" % self._last_status[:2] if self._last_status else "no status"
+        if self._last_log:
+            return f"{status}, last openvpn3 message: {_redact(self._last_log)}"
+        return status
+
+    def _reason(self, msg, default):
+        """Why openvpn3 gave up: its status message or the last client event."""
+        if msg:
+            return msg
+        if self._last_event:
+            name, info = _EVENT.match(self._last_event).groups()
+            text = _EVENT_TEXT.get(name, name)
+            return f"{text}: {_redact(info)}" if info else text
+        return default
 
     def _on_status(self, major, minor, msg):
         # The same change can arrive twice: once from the session manager
@@ -160,9 +206,15 @@ class Tunnel:
         is_url = major == ov3.MAJOR_SESSION and minor == ov3.SESS_AUTH_URL
         # The login URL carries a one-time token: keep it out of the journal.
         log.info("status %d/%d %s", major, minor, _url_host(msg) if is_url else msg)
+        if (major == ov3.MAJOR_CONNECTION and minor in (ov3.CONN_DISCONNECTED, ov3.CONN_DONE)) \
+                or (major == ov3.MAJOR_PROCESS and minor in (ov3.PROC_STOPPED, ov3.PROC_KILLED)):
+            # The backend is gone, there is nothing left to disconnect.
+            self.ended = True
         if self.stopping:
             return
         if is_url:
+            if self.connected_once:
+                log.info("the server asks to log in again")
             self._open_login_url(msg)
         elif minor == ov3.CFG_OK and not self.connect_started:
             self._ready_and_connect()
@@ -171,12 +223,12 @@ class Tunnel:
         elif major == ov3.MAJOR_CONNECTION and minor == ov3.CONN_CONNECTED:
             self._report_connected()
         elif major == ov3.MAJOR_CONNECTION and minor == ov3.CONN_AUTH_FAILED:
-            self._fail(NM.VpnPluginFailure.LOGIN_FAILED, msg or "Authentication failed")
+            self._fail(NM.VpnPluginFailure.LOGIN_FAILED, self._reason(msg, "Authentication failed"))
         elif (major == ov3.MAJOR_CONNECTION
               and minor in (ov3.CONN_FAILED, ov3.CONN_DISCONNECTED, ov3.CONN_DONE)) \
                 or (major == ov3.MAJOR_PROCESS and minor in (ov3.PROC_STOPPED, ov3.PROC_KILLED)) \
                 or major == ov3.MAJOR_CFG_ERROR:
-            self._fail(NM.VpnPluginFailure.CONNECT_FAILED, msg or "Connection failed")
+            self._fail(NM.VpnPluginFailure.CONNECT_FAILED, self._reason(msg, "Connection failed"))
 
     def _open_login_url(self, url):
         """Web based login: open the server's URL in the desktop user's browser."""
@@ -293,11 +345,18 @@ class Tunnel:
         log.warning("%s", message)
         if self.stopping:
             return
+        self.failed = True
         # Both paths end in do_disconnect() -> stop(), which tears the session down.
         if self.connected_once:
             self.plugin.disconnect()
         else:
             self.plugin.failure(reason)
+
+
+def _no_profile(s_vpn):
+    if fmt.profile_is_secret(s_vpn.get_data_item):
+        return "The OpenVPN profile is stored as a secret and was not provided"
+    return "The connection has no OpenVPN profile"
 
 
 class Plugin(VpnPlugin):
@@ -310,7 +369,7 @@ class Plugin(VpnPlugin):
         s_vpn = connection.get_setting_vpn()
         config = get_profile(s_vpn)
         if not config:
-            raise PluginError("BadArguments", "The connection has no OpenVPN profile")
+            raise PluginError("BadArguments", _no_profile(s_vpn))
         if ovpn.needs_user_pass(config) and not s_vpn.get_data_item(KEY_USERNAME):
             raise PluginError("BadArguments", "The profile requires a username")
         self.tunnel = Tunnel(self, self.client_factory(), connection, interactive)
@@ -318,7 +377,12 @@ class Plugin(VpnPlugin):
 
     def do_need_secrets(self, connection):
         s_vpn = connection.get_setting_vpn()
-        config = get_profile(s_vpn) or ""
+        config = get_profile(s_vpn)
+        if config is None:
+            if fmt.profile_flags(s_vpn.get_data_item) & NM.SettingSecretFlags.AGENT_OWNED:
+                # The agent keeps it; what else is needed follows from it.
+                return NM.SETTING_VPN_SETTING_NAME
+            raise PluginError("BadArguments", _no_profile(s_vpn))
 
         def missing(key):
             return not s_vpn.get_secret(key) \

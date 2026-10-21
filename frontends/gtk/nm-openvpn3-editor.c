@@ -2,6 +2,10 @@
 /*
  * Editor page for openvpn3 connections. Built twice: against GTK 4 for
  * GNOME Settings and against GTK 3 for nm-connection-editor.
+ *
+ * A front-end like any other (docs/frontends.md): profiles are loaded through
+ * the plugin's import, the fields shown follow the connection's data keys and
+ * saving edits a copy of the original setting in place.
  */
 
 #include <gtk/gtk.h>
@@ -41,7 +45,9 @@ struct _Openvpn3Editor {
     Row        password;
     Row        cert_pass;
     GtkWidget *show_passwords;
-    char      *config;
+    /* Copy of the edited setting, or of the one loaded from a file. */
+    NMSettingVpn *s_vpn;
+    char         *config;
 };
 
 static void openvpn3_editor_interface_init(NMVpnEditorInterface *iface);
@@ -62,19 +68,29 @@ row_set_visible(Row *row, gboolean visible)
     gtk_widget_set_visible(row->entry, visible);
 }
 
-/* Shows the fields the loaded profile actually uses. */
+static gboolean
+has_data(NMSettingVpn *s_vpn, const char *key)
+{
+    return nm_setting_vpn_get_data_item(s_vpn, key) != NULL;
+}
+
+/* Shows the fields the connection uses: a secret has flags when it is needed. */
 static void
 refresh_profile(Openvpn3Editor *self)
 {
-    g_autoptr(GError) error      = NULL;
-    g_autoptr(Openvpn3Profile) p = self->config ? openvpn3_profile_parse(self->config, "/nonexistent", &error) : NULL;
+    const char *remote          = nm_setting_vpn_get_data_item(self->s_vpn, OPENVPN3_KEY_REMOTE);
+    g_autofree char *old_remote = remote || !self->config ? NULL : openvpn3_profile_remote(self->config);
+    gboolean user_pass          = has_data(self->s_vpn, OPENVPN3_KEY_PASSWORD "-flags");
 
-    gtk_label_set_text(GTK_LABEL(self->remote_label), p && p->remote ? p->remote : "—");
+    gtk_label_set_text(GTK_LABEL(self->remote_label), remote ? remote : old_remote ? old_remote : "—");
     gtk_label_set_text(GTK_LABEL(self->status_label),
-                       !self->config ? "No profile loaded yet" : p ? "Profile loaded" : error->message);
-    row_set_visible(&self->username, !p || p->needs_user_pass);
-    row_set_visible(&self->password, !p || p->needs_user_pass);
-    row_set_visible(&self->cert_pass, p && p->needs_cert_pass);
+                       self->config ? "Profile loaded"
+                       : openvpn3_setting_profile_is_secret(self->s_vpn)
+                           ? "The profile is stored as a secret and was not provided"
+                           : "No profile loaded yet");
+    row_set_visible(&self->username, !self->config || user_pass);
+    row_set_visible(&self->password, !self->config || user_pass);
+    row_set_visible(&self->cert_pass, has_data(self->s_vpn, OPENVPN3_KEY_CERT_PASS "-flags"));
 }
 
 static void
@@ -82,11 +98,18 @@ load_profile(Openvpn3Editor *self, const char *path)
 {
     g_autoptr(GError) error      = NULL;
     g_autoptr(Openvpn3Profile) p = openvpn3_profile_load(path, &error);
+    g_autoptr(NMConnection) con  = NULL;
+    NMSettingSecretFlags flags   = openvpn3_setting_get_profile_flags(self->s_vpn);
 
     if (!p) {
         gtk_label_set_text(GTK_LABEL(self->status_label), error->message);
         return;
     }
+    /* The same connection nmcli would import, keeping where the profile is kept. */
+    con = openvpn3_connection_from_profile(p, "import");
+    g_clear_object(&self->s_vpn);
+    self->s_vpn = NM_SETTING_VPN(nm_setting_duplicate(NM_SETTING(nm_connection_get_setting_vpn(con))));
+    openvpn3_setting_set_profile(self->s_vpn, p->config, flags);
     g_free(self->config);
     self->config = g_steal_pointer(&p->config);
     if (p->username)
@@ -242,13 +265,12 @@ build_ui(Openvpn3Editor *self, NMConnection *connection)
     gtk_grid_attach(GTK_GRID(grid), self->show_passwords, 1, 5, 1, 1);
     g_signal_connect(self->show_passwords, "toggled", G_CALLBACK(show_passwords_toggled), self);
 
-    if (s_vpn) {
-        self->config = openvpn3_setting_get_profile(s_vpn);
-        if ((value = nm_setting_vpn_get_data_item(s_vpn, OPENVPN3_KEY_USERNAME)))
-            entry_set_text(self->username.entry, value);
-    }
-    setup_secret(&self->password, s_vpn, OPENVPN3_KEY_PASSWORD, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
-    setup_secret(&self->cert_pass, s_vpn, OPENVPN3_KEY_CERT_PASS, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
+    self->s_vpn  = s_vpn ? NM_SETTING_VPN(nm_setting_duplicate(NM_SETTING(s_vpn))) : NM_SETTING_VPN(nm_setting_vpn_new());
+    self->config = openvpn3_setting_get_profile(self->s_vpn);
+    if ((value = nm_setting_vpn_get_data_item(self->s_vpn, OPENVPN3_KEY_USERNAME)))
+        entry_set_text(self->username.entry, value);
+    setup_secret(&self->password, self->s_vpn, OPENVPN3_KEY_PASSWORD, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
+    setup_secret(&self->cert_pass, self->s_vpn, OPENVPN3_KEY_CERT_PASS, NM_SETTING_SECRET_FLAG_AGENT_OWNED);
 
     g_signal_connect_swapped(self->username.entry, "changed", G_CALLBACK(changed), self);
     g_signal_connect_swapped(self->password.entry, "changed", G_CALLBACK(changed), self);
@@ -277,38 +299,45 @@ save_secret(Row *row, NMSettingVpn *s_vpn, const char *key)
     nm_setting_set_secret_flags(NM_SETTING(s_vpn), key, flags, NULL);
     if (value && *value && !(flags & NM_SETTING_SECRET_FLAG_NOT_SAVED))
         nm_setting_vpn_add_secret(s_vpn, key, value);
+    else
+        nm_setting_vpn_remove_secret(s_vpn, key);
 }
 
 static gboolean
 update_connection(NMVpnEditor *editor, NMConnection *connection, GError **error)
 {
     Openvpn3Editor *self = OPENVPN3_EDITOR(editor);
-    g_autoptr(Openvpn3Profile) p = NULL;
     NMSettingVpn *s_vpn;
     const char *username;
 
     if (!self->config) {
+        /* Saving now would drop the profile from the connection. */
         g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
-                            OPENVPN3_KEY_PROFILE);
+                            openvpn3_setting_profile_is_secret(self->s_vpn)
+                                ? "The OpenVPN profile is stored as a secret and was not provided"
+                                : OPENVPN3_KEY_PROFILE);
         return FALSE;
     }
-    p = openvpn3_profile_parse(self->config, "/nonexistent", error);
-    if (!p)
-        return FALSE;
 
-    s_vpn = NM_SETTING_VPN(nm_setting_vpn_new());
+    /* Edit a copy in place: keys this editor does not know stay. */
+    s_vpn = NM_SETTING_VPN(nm_setting_duplicate(NM_SETTING(self->s_vpn)));
     g_object_set(s_vpn, NM_SETTING_VPN_SERVICE_TYPE, OPENVPN3_SERVICE_TYPE, NULL);
-    openvpn3_setting_set_profile(s_vpn, self->config);
+    /* Moves an old data copy of the profile into the secrets. */
+    openvpn3_setting_set_profile(s_vpn, self->config, openvpn3_setting_get_profile_flags(s_vpn));
 
-    if (p->needs_user_pass) {
+    if (has_data(s_vpn, OPENVPN3_KEY_PASSWORD "-flags")) {
         username = entry_get_text(self->username.entry);
         if (username && *username)
             nm_setting_vpn_add_data_item(s_vpn, OPENVPN3_KEY_USERNAME, username);
+        else
+            nm_setting_vpn_remove_data_item(s_vpn, OPENVPN3_KEY_USERNAME);
         save_secret(&self->password, s_vpn, OPENVPN3_KEY_PASSWORD);
-        nm_setting_set_secret_flags(NM_SETTING(s_vpn), OPENVPN3_KEY_CHALLENGE,
-                                    NM_SETTING_SECRET_FLAG_NOT_SAVED, NULL);
+        /* One-time codes are asked for on every connect and never stored. */
+        if (!has_data(s_vpn, OPENVPN3_KEY_CHALLENGE "-flags"))
+            nm_setting_set_secret_flags(NM_SETTING(s_vpn), OPENVPN3_KEY_CHALLENGE,
+                                        NM_SETTING_SECRET_FLAG_NOT_SAVED, NULL);
     }
-    if (p->needs_cert_pass)
+    if (has_data(s_vpn, OPENVPN3_KEY_CERT_PASS "-flags"))
         save_secret(&self->cert_pass, s_vpn, OPENVPN3_KEY_CERT_PASS);
 
     nm_connection_add_setting(connection, NM_SETTING(s_vpn));
@@ -326,6 +355,7 @@ dispose(GObject *object)
     Openvpn3Editor *self = OPENVPN3_EDITOR(object);
 
     g_clear_object(&self->root);
+    g_clear_object(&self->s_vpn);
     g_clear_pointer(&self->config, g_free);
     G_OBJECT_CLASS(openvpn3_editor_parent_class)->dispose(object);
 }

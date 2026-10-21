@@ -1,12 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
  * libnm VPN editor plugin for openvpn3: import/export of profiles, loads the
- * GTK 4 editor on demand so that the plugin itself does not link GTK.
+ * GTK editor on demand so that the plugin itself does not link GTK. Other
+ * front-ends use import/export only (docs/frontends.md).
  */
 
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <string.h>
 
 #include "ovpn-import.h"
@@ -53,18 +56,68 @@ import_from_file(NMVpnEditorPlugin *plugin, const char *path, GError **error)
     return openvpn3_connection_from_profile(p, base);
 }
 
+/* nmcli hands over the connection without its secrets; ask NetworkManager
+ * for them as the calling user would. */
+static char *
+fetch_secret_profile(NMConnection *connection, GError **error)
+{
+    const char *obj_path              = nm_connection_get_path(connection);
+    g_autoptr(GDBusConnection) bus    = NULL;
+    g_autoptr(GVariant) reply         = NULL;
+    g_autoptr(GVariant) secrets       = NULL;
+    g_autoptr(NMConnection) copy      = NULL;
+
+    if (!obj_path)
+        return NULL;
+    bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, error);
+    if (!bus)
+        return NULL;
+    reply = g_dbus_connection_call_sync(bus, NM_DBUS_SERVICE, obj_path, NM_DBUS_INTERFACE_SETTINGS_CONNECTION,
+                                        "GetSecrets", g_variant_new("(s)", NM_SETTING_VPN_SETTING_NAME),
+                                        G_VARIANT_TYPE("(a{sa{sv}})"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, error);
+    if (!reply)
+        return NULL;
+    g_variant_get(reply, "(@a{sa{sv}})", &secrets);
+    copy = nm_simple_connection_new_clone(connection);
+    if (!nm_connection_update_secrets(copy, NM_SETTING_VPN_SETTING_NAME, secrets, error))
+        return NULL;
+    return openvpn3_setting_get_profile(nm_connection_get_setting_vpn(copy));
+}
+
 static gboolean
 export_to_file(NMVpnEditorPlugin *plugin, const char *path, NMConnection *connection, GError **error)
 {
-    g_autofree char *config = openvpn3_setting_get_profile(nm_connection_get_setting_vpn(connection));
+    NMSettingVpn *s_vpn     = nm_connection_get_setting_vpn(connection);
+    g_autofree char *config = openvpn3_setting_get_profile(s_vpn);
 
+    if (!config && openvpn3_setting_profile_is_secret(s_vpn)) {
+        g_autoptr(GError) local = NULL;
+
+        config = fetch_secret_profile(connection, &local);
+        if (local) {
+            g_set_error(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
+                        "The OpenVPN profile is stored as a secret and could not be read: %s", local->message);
+            return FALSE;
+        }
+    }
     if (!config) {
         g_set_error_literal(error, NM_CONNECTION_ERROR, NM_CONNECTION_ERROR_MISSING_PROPERTY,
-                            "The connection has no OpenVPN profile");
+                            openvpn3_setting_profile_is_secret(s_vpn)
+                                ? "The OpenVPN profile is stored as a secret and was not provided"
+                                : "The connection has no OpenVPN profile");
         return FALSE;
     }
-    /* Credentials stay in NetworkManager, the exported profile asks for them. */
-    return g_file_set_contents(path, config, -1, error);
+    /* Credentials stay in NetworkManager, the exported profile asks for
+     * them; the private key is still in it. GLib keeps the mode of a file
+     * it replaces, so tighten that first. */
+    if (g_chmod(path, 0600) < 0 && errno != ENOENT) {
+        int err = errno;
+
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(err), "Cannot restrict %s: %s", path,
+                    g_strerror(err));
+        return FALSE;
+    }
+    return g_file_set_contents_full(path, config, -1, G_FILE_SET_CONTENTS_CONSISTENT, 0600, error);
 }
 
 static char *

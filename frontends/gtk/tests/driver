@@ -1,0 +1,94 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""Conformance driver for the GTK editors (docs/frontends.md).
+
+OPENVPN3_EDITOR_GTK=3 drives the GTK 3 editor, otherwise GTK 4. Needs a
+display (GDK_BACKEND=broadway works headless); without one it exits 77,
+or fails when OPENVPN3_EDITOR_TEST_REQUIRED is set.
+
+Loading a profile goes the way GNOME Settings imports one: the plugin's
+import, then the editor saves it. Editing types into the editor's fields.
+The password storage menu of libnma is not driven, so storage scenarios
+are skipped.
+"""
+
+import json
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:0] = [os.path.join(HERE, "..", "..", "..", "src"), os.path.join(HERE, "..", "..", "..", "tests", "harness")]
+
+# GTK 4.14 reports success from init_check() without any display and then
+# crashes, so require one to be configured explicitly.
+if not any(os.environ.get(v) for v in ("DISPLAY", "WAYLAND_DISPLAY", "BROADWAY_DISPLAY")):
+    if os.environ.get("OPENVPN3_EDITOR_TEST_REQUIRED"):
+        sys.exit("no display for the GTK editor")
+    sys.exit(77)
+
+import gi  # noqa: E402
+
+GTK = os.environ.get("OPENVPN3_EDITOR_GTK", "4")
+gi.require_version("NM", "1.0")
+gi.require_version("Gtk", f"{GTK}.0")
+from gi.repository import Gtk  # noqa: E402
+
+if not (Gtk.init_check() if GTK == "4" else Gtk.init_check(None)[0]):
+    sys.exit("cannot open the display")
+
+import nmjson  # noqa: E402
+
+
+def entries(widget):
+    def children(w):
+        if GTK == "3":
+            return w.get_children() if isinstance(w, Gtk.Container) else []
+        found, child = [], w.get_first_child()
+        while child is not None:
+            found.append(child)
+            child = child.get_next_sibling()
+        return found
+
+    def walk(w):
+        for c in children(w):
+            yield c
+            yield from walk(c)
+    found = [w for w in walk(widget) if isinstance(w, Gtk.Entry)]
+    # Grid children come back in reverse attach order on GTK 3.
+    return sorted(found, key=lambda w: widget.child_get_property(w, "top-attach")) if GTK == "3" else found
+
+
+def save_through_editor(con, changes):
+    editor = nmjson.load_plugin().get_editor(con)
+    user, password, cert_pass = entries(editor.get_widget())
+    if "username" in changes:
+        user.set_text(changes["username"] or "")
+    for key, entry in (("password", password), ("cert-pass", cert_pass)):
+        if "value" in changes.get(key, {}):
+            entry.set_text(changes[key]["value"] or "")
+    if not editor.update_connection(con):
+        sys.exit("update_connection failed")
+    return con
+
+
+def capabilities():
+    print(json.dumps({"name": f"GTK {GTK}", "secret-storage": [], "agent-profile": True, "secrets": False}))
+
+
+def load(profile, out):
+    nmjson.write(save_through_editor(nmjson.load_plugin().import_(profile), {}), out)
+
+
+def edit(inp, changes_path, out):
+    with open(changes_path) as f:
+        changes = json.load(f)
+    nmjson.write(save_through_editor(nmjson.read(inp), changes), out)
+
+
+def main():
+    cmd, args = sys.argv[1], sys.argv[2:]
+    {"capabilities": capabilities, "load": load, "edit": edit}[cmd](*args)
+
+
+if __name__ == "__main__":
+    main()
